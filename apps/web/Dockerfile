@@ -3,7 +3,10 @@ WORKDIR /app
 
 COPY package.json package-lock.json* ./
 COPY apps/web/package.json apps/web/package.json
-RUN npm install --workspace=apps/web --include-workspace-root
+# --include=dev: some hosts (Coolify among them) leak NODE_ENV=production
+# into the build environment, which makes plain `npm install` silently omit
+# devDependencies (tsc/vite) - force them regardless.
+RUN npm install --workspace=apps/web --include-workspace-root --include=dev
 
 COPY apps/web apps/web
 ARG VITE_API_URL

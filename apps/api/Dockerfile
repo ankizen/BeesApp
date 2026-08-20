@@ -5,7 +5,10 @@ WORKDIR /app
 
 COPY package.json package-lock.json* ./
 COPY apps/api/package.json apps/api/package.json
-RUN npm install --workspace=apps/api --include-workspace-root
+# --include=dev: some hosts (Coolify among them) leak NODE_ENV=production
+# into the build environment, which makes plain `npm install` silently omit
+# devDependencies (tsc/prisma/tsx) - force them regardless.
+RUN npm install --workspace=apps/api --include-workspace-root --include=dev
 
 COPY apps/api apps/api
 RUN npm run prisma:generate -w apps/api
