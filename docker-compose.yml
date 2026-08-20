@@ -40,8 +40,13 @@ services:
       redis:
         condition: service_healthy
     command: sh -c "npx prisma migrate deploy && node dist/server.js"
-    ports:
-      - "4000:4000"
+    # expose, not ports: a reverse proxy (Coolify/Traefik) reaches this over
+    # the internal Docker network by container port - publishing it to the
+    # host as well just risks colliding with another service's host port.
+    # Standalone (no proxy in front): add `ports: ["4000:4000"]` back, or
+    # run `docker compose -f docker-compose.yml -f docker-compose.override.yml up`.
+    expose:
+      - "4000"
 
   worker:
     build:
@@ -71,8 +76,8 @@ services:
       args:
         VITE_API_URL: ${APP_BASE_URL}
     restart: unless-stopped
-    ports:
-      - "8080:80"
+    expose:
+      - "80"
     depends_on:
       - api
 
