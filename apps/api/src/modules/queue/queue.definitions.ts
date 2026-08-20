@@ -4,15 +4,17 @@ import { createRedisConnection } from "../../lib/redis.js";
 // One queue per platform: independent concurrency, rate limits, and backoff
 // per platform, and one platform's backlog never blocks another's.
 // Adding a platform (LinkedIn, Bluesky, ...) means adding one entry here.
+// BullMQ queue names may not contain ":" (it uses that as the Redis key
+// delimiter internally - "publish:facebook" throws at construction time).
 export const PLATFORM_QUEUE_NAMES = {
-  facebook: "publish:facebook",
-  threads: "publish:threads",
-  mastodon: "publish:mastodon",
+  facebook: "publish-facebook",
+  threads: "publish-threads",
+  mastodon: "publish-mastodon",
 } as const;
 
 export type PlatformKey = keyof typeof PLATFORM_QUEUE_NAMES;
 
-export const DEAD_LETTER_QUEUE_NAME = "publish:dead-letter";
+export const DEAD_LETTER_QUEUE_NAME = "publish-dead-letter";
 
 const connection = createRedisConnection();
 

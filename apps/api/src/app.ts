@@ -34,10 +34,6 @@ export function buildApp() {
   app.register(securityPlugin);
   app.register(jwtPlugin);
 
-  app.addHook("onReady", async () => {
-    logger.info("DIAG: app ready, all plugins registered");
-  });
-
   app.get("/health", async () => ({ status: "ok" }));
 
   app.register(authRoutes, { prefix: "/api/auth" });
