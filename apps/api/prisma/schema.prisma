@@ -1,0 +1,277 @@
+// Content Hub - Prisma schema
+// Modular monolith, designed to stay fast at millions of rows:
+// - narrow indexes on the columns we actually filter/sort by
+// - append-only PublishLog (never updated) so it can be partitioned/archived later
+// - SocialPlatform is a lookup table (not an enum) so adding LinkedIn/Bluesky/etc
+//   is an INSERT, not a migration
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  OWNER
+  ADMIN
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  role         UserRole @default(ADMIN)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  wordpressSites WordpressSite[]
+  socialAccounts SocialAccount[]
+  apiKeys        ApiKey[]
+  settings       Setting[]
+  refreshTokens  RefreshToken[]
+
+  @@map("users")
+}
+
+// Hashed, revocable, one row per session/device - never store the raw token.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// WordPress
+// ---------------------------------------------------------------------------
+
+enum WordpressSiteStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model WordpressSite {
+  id              String              @id @default(uuid())
+  userId          String
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name            String
+  url             String
+  username        String
+  appPasswordEnc  String // WP Application Password, encrypted at rest (AES-256-GCM)
+  webhookSecretEnc String // shared secret the plugin signs webhook payloads with
+  status          WordpressSiteStatus @default(ACTIVE)
+  lastSyncAt      DateTime?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  articles Article[]
+  apiKeys  ApiKey[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("wordpress_sites")
+}
+
+// ---------------------------------------------------------------------------
+// Articles
+// ---------------------------------------------------------------------------
+
+enum ArticleStatus {
+  PENDING // stored, publish jobs not yet enqueued
+  QUEUED // publish jobs enqueued
+  PUBLISHING // at least one job in progress
+  PUBLISHED // all jobs succeeded
+  PARTIAL // some succeeded, some failed
+  FAILED // all jobs failed
+}
+
+model Article {
+  id               String        @id @default(uuid())
+  wordpressSiteId  String
+  wordpressSite    WordpressSite @relation(fields: [wordpressSiteId], references: [id], onDelete: Cascade)
+  wpPostId         Int
+  title            String
+  slug             String
+  url              String
+  excerpt          String        @db.Text
+  featuredImageUrl String?
+  publishedAt      DateTime
+  categories       String[]      @default([])
+  tags             String[]      @default([])
+  status           ArticleStatus @default(PENDING)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  publishJobs PublishJob[]
+
+  // A given WP post can only be stored once per site; re-sync upserts it.
+  @@unique([wordpressSiteId, wpPostId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([wordpressSiteId])
+  @@map("articles")
+}
+
+// ---------------------------------------------------------------------------
+// Social platforms / accounts
+// ---------------------------------------------------------------------------
+
+// Lookup table instead of an enum: adding a platform (LinkedIn, Bluesky,
+// Telegram, Discord, X, RSS...) is a seed row, no schema migration.
+model SocialPlatform {
+  id        String   @id @default(uuid())
+  key       String   @unique // "facebook" | "threads" | "mastodon" | ...
+  name      String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  socialAccounts SocialAccount[]
+
+  @@map("social_platforms")
+}
+
+enum SocialAccountStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+model SocialAccount {
+  id               String               @id @default(uuid())
+  userId           String
+  user             User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  platformId       String
+  platform         SocialPlatform       @relation(fields: [platformId], references: [id])
+  accountName      String // display name (Page name, @handle, instance user)
+  externalAccountId String // Page ID / Threads user ID / Mastodon account id
+  instanceUrl      String? // Mastodon only
+  accessTokenEnc   String // encrypted at rest
+  refreshTokenEnc  String?
+  tokenExpiresAt   DateTime?
+  metadata         Json                 @default("{}") // scopes, page category, etc
+  status           SocialAccountStatus  @default(ACTIVE)
+  isAutoPublish    Boolean              @default(true) // include in fan-out on new articles
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  publishJobs PublishJob[]
+
+  @@index([userId])
+  @@index([platformId])
+  @@index([status])
+  @@map("social_accounts")
+}
+
+// ---------------------------------------------------------------------------
+// Publishing pipeline
+// ---------------------------------------------------------------------------
+
+// FAILED covers both "exhausted retries" and "non-retryable error" - the
+// dead-letter *queue* (Redis/BullMQ) is where those jobs go for manual
+// review/replay, so there's no separate DB status for it.
+enum PublishJobStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
+model PublishJob {
+  id              String            @id @default(uuid())
+  articleId       String
+  article         Article           @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  socialAccountId String
+  socialAccount   SocialAccount     @relation(fields: [socialAccountId], references: [id], onDelete: Cascade)
+  status          PublishJobStatus  @default(PENDING)
+  attempts        Int               @default(0)
+  maxAttempts     Int               @default(5)
+  bullJobId       String? // correlates back to the BullMQ job
+  errorMessage    String?
+  scheduledAt     DateTime          @default(now())
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  logs PublishLog[]
+
+  @@index([status])
+  @@index([socialAccountId])
+  @@index([articleId])
+  @@index([createdAt])
+  @@map("publish_jobs")
+}
+
+// Append-only audit trail of every publish attempt. Never updated, so it's
+// safe to partition by createdAt or ship to cold storage once it's large.
+model PublishLog {
+  id           String     @id @default(uuid())
+  publishJobId String
+  publishJob   PublishJob @relation(fields: [publishJobId], references: [id], onDelete: Cascade)
+  platform     String
+  success      Boolean
+  statusCode   Int?
+  message      String?
+  responseBody Json?
+  createdAt    DateTime   @default(now())
+
+  @@index([publishJobId])
+  @@index([success])
+  @@index([createdAt])
+  @@map("publish_logs")
+}
+
+// ---------------------------------------------------------------------------
+// API keys (WordPress webhook auth / future external API access)
+// ---------------------------------------------------------------------------
+
+model ApiKey {
+  id              String         @id @default(uuid())
+  userId          String
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wordpressSiteId String?
+  wordpressSite   WordpressSite? @relation(fields: [wordpressSiteId], references: [id], onDelete: Cascade)
+  name            String
+  keyPrefix       String // first 8 chars, shown in UI for identification
+  keyHash         String         @unique // sha256 of the full key, never store plaintext
+  scopes          String[]       @default(["webhook:write"])
+  lastUsedAt      DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime       @default(now())
+
+  @@index([userId])
+  @@index([wordpressSiteId])
+  @@map("api_keys")
+}
+
+// ---------------------------------------------------------------------------
+// Settings (per-user key/value config: caption template, defaults, etc)
+// ---------------------------------------------------------------------------
+
+model Setting {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key       String
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, key])
+  @@map("settings")
+}
