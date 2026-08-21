@@ -47,6 +47,15 @@ services:
     # run `docker compose -f docker-compose.yml -f docker-compose.override.yml up`.
     expose:
       - "4000"
+    # No curl/wget on node:alpine - Node's own http module does the probe.
+    # Doubles as the actual signal that migrations finished and the server
+    # is listening, not just that the process hasn't crashed yet.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   worker:
     build:
@@ -62,8 +71,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # Not just "started": api's healthcheck only passes once its startup
+      # command (prisma migrate deploy && node dist/server.js) has actually
+      # finished migrating - starting the worker before that risks it
+      # querying tables that don't exist yet.
       api:
-        condition: service_started
+        condition: service_healthy
     command: node dist/workers/index.js
     # Scale independently from the API, e.g.: docker compose up -d --scale worker=3
     deploy:
